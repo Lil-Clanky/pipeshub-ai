@@ -2552,6 +2552,22 @@ class IGraphDBProvider(ABC):
                 applied.append(key)
         return applied
 
+    async def delete_node_if_match(
+        self, key: str, collection: str, expected: dict[str, Any], transaction: str | None = None,
+    ) -> bool:
+        """Delete the node only while every field in ``expected`` still holds its value (``None`` means absent), in one
+        statement, so a delete decided from an earlier read never removes a node another writer has since replaced or moved.
+        Meant for nodes that carry no edges: no edge is removed on ArangoDB and PostgreSQL.
+
+        Returns:
+            True iff the node was deleted.
+
+        Raises:
+            ValueError: when ``expected`` is empty.
+            NotImplementedError: on a store that has not implemented it (never a silent unconditional delete).
+        """
+        raise NotImplementedError(f"{type(self).__name__} has no conditional delete")
+
     @abstractmethod
     async def update_node_fields_if_match(
         self,

@@ -153,6 +153,7 @@ CALLS = [
     ("update_node_fields_if_match", ("k", "things", {"v": 1}, {"v": 0}), {}),
     ("update_node_fields_if", ("k", "things", {"v": 1}, [Cond("v", "is_null")]), {}),
     ("set_record_properties", ("k",), {"values": {}, "previous_names": (), "controls": {"propsVer": 1}, "conditions": [Cond("propsVer", "is_null")]}),
+    ("delete_node_if_match", ("k", "things", {"v": 0}), {}),
     ("delete_nodes", (["k"], "things"), {}),
     ("delete_nodes_and_edges", (["k"], "things"), {}),
     ("batch_create_edges", ([_EDGE], "belongsTo"), {}),
@@ -288,6 +289,40 @@ async def test_a_conditional_update_removes_a_field_set_to_none_and_needs_an_exp
         with pytest.raises(ValueError, match="expectation"):
             await p.update_node_fields_if_match("c", "things", {"z": 4}, {})
         assert (await p.get_document("c", "things"))["z"] == 2
+
+
+async def test_a_conditional_delete_removes_the_node_only_while_the_expectation_holds(pg_provider, orgs, org_ctx) -> None:
+    a, b = orgs
+    p = pg_provider
+    with org_ctx(a):
+        await p.batch_upsert_nodes([{"_key": "d", "v": "x", "w": 1}], "things")
+        assert await p.delete_node_if_match("d", "things", {"v": "other"}) is False
+        assert await p.delete_node_if_match("d", "things", {"v": "x", "missing": None}) is True       # None expects the field absent
+        assert await p.get_document("d", "things") is None
+        assert await p.delete_node_if_match("d", "things", {"v": "x"}) is False                       # already gone
+        with pytest.raises(ValueError, match="expectation"):
+            await p.delete_node_if_match("d", "things", {})
+    with org_ctx(a):
+        await p.batch_upsert_nodes([{"_key": "same", "v": "a"}], "things")
+    with org_ctx(b):
+        assert await p.delete_node_if_match("same", "things", {"v": "a"}) is False                    # another org's node is not reached
+    with org_ctx(a):
+        assert (await p.get_document("same", "things"))["v"] == "a"
+
+
+async def test_of_concurrent_conditional_deletes_holding_the_same_expectation_exactly_one_applies(pg_provider, orgs, org_ctx) -> None:
+    a, _ = orgs
+    p = pg_provider
+
+    async def one(key: str) -> bool:
+        with org_ctx(a):
+            return await p.delete_node_if_match(key, "things", {"ver": 1})
+    for round_ in range(5):
+        key = f"del{round_}"
+        with org_ctx(a):
+            await p.batch_upsert_nodes([{"_key": key, "ver": 1}], "things")
+        results = await asyncio.gather(*(one(key) for _ in range(6)))
+        assert results.count(True) == 1, (round_, results)
 
 
 async def test_of_concurrent_conditional_updates_holding_the_same_expectation_exactly_one_applies(pg_provider, orgs, org_ctx) -> None:

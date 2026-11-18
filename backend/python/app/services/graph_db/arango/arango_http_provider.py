@@ -7010,6 +7010,34 @@ class ArangoHTTPProvider(NamedEntityGraphMixin, IGraphDBProvider):
         )
         return bool(rows)
 
+    async def delete_node_if_match(
+        self, key: str, collection: str, expected: dict[str, Any], transaction: str | None = None,
+    ) -> bool:
+        """See :meth:`IGraphDBProvider.delete_node_if_match`."""
+        if not expected:
+            raise ValueError("delete_node_if_match needs an expectation")
+        bind_vars: dict[str, Any] = {"@collection": collection, "key": key}
+        filters = []
+        for i, (name, value) in enumerate(expected.items()):
+            bind_vars[f"f{i}"] = name
+            if value is None:
+                filters.append(f"FILTER doc[@f{i}] == null")
+            else:
+                bind_vars[f"v{i}"] = value
+                filters.append(f"FILTER doc[@f{i}] == @v{i}")
+        newline = "\n                "
+        query = f"""
+            FOR doc IN @@collection
+                FILTER doc._key == @key
+                {newline.join(filters)}
+                REMOVE doc IN @@collection
+                RETURN 1
+            """
+        rows = await self._retry_write_conflicts(
+            lambda: self.http_client.execute_aql(query, bind_vars=bind_vars, txn_id=transaction), transaction,
+        )
+        return bool(rows)
+
     async def _write_then_check_clock(self, collection: str, query: str, bind_vars: dict[str, Any], clock_at_most: float) -> bool:
         """``query`` in a stream transaction of its own, then the store's clock in a second statement, committed only while the clock is not past
         ``clock_at_most``. AQL folds `DATE_NOW()` into a constant when it compiles a statement, before the statement waits for a collection lock

@@ -1,6 +1,9 @@
 """Integration tests against real PostgreSQL (every version in MIGRATE_TEST_PG_BINS). See conftest.py."""
+import ast
+import re
 import textwrap
 import time
+from pathlib import Path
 
 import psycopg
 import pytest
@@ -8,6 +11,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.exc import DBAPIError
 
 from db.lib import ddl
+from db.locations import DB_DIR, version_locations
 
 from .conftest import _free_port, run_migrate, start_migrate
 
@@ -39,7 +43,41 @@ def edition_with(tmp_path, *module_dirs):
     return {"PIPESHUB_EDITION_FILE": str(ed), "PG_MIGRATE_SURFACE_CHECK": "skip"}      # the probe module ships no surface file
 
 
-def write_probe(tmp_path, second_sql="CREATE TABLE probe.t2 (id int);\nSELECT kernel.register_internal('probe.t2')", third=False):
+def _literal(tree, name, default=None):
+    """The value of a module-level ``name = <literal>`` of a revision file, read without importing it."""
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == name for t in node.targets):
+            return ast.literal_eval(node.value)
+    return default
+
+
+def computed_heads(locations):
+    """``(HEADS, REVISION_HEADS)`` read from the revision files under ``locations`` (module directories).
+
+    ``HEADS`` maps a branch to ``(its highest revision number, the highest ``min_code_epoch`` of its files)``, the pair its
+    epoch row stores. ``REVISION_HEADS`` are the last revision of each branch that no other revision depends on, so a
+    branch that is added later and depends on a core revision takes that revision out of the heads, and the expectation
+    follows without being edited."""
+    branches, depended_on = {}, set()
+    for location in locations:
+        files = sorted(Path(location).glob("[0-9][0-9][0-9][0-9]_*.py"))
+        if not files:
+            continue
+        trees = [ast.parse(f.read_text()) for f in files]
+        labels = _literal(trees[0], "branch_labels") or (Path(location).name,)
+        branch = labels[0]
+        number = int(re.match(r"(\d{4})_", files[-1].name).group(1))
+        epoch = max(_literal(tree, "min_code_epoch", 0) for tree in trees)
+        branches[branch] = ((number, epoch), _literal(trees[-1], "revision"))
+        for tree in trees:
+            dep = _literal(tree, "depends_on")
+            depended_on.update([dep] if isinstance(dep, str) else dep or [])
+    heads = {branch: pair for branch, (pair, _rev) in branches.items()}
+    revisions = {rev for _pair, rev in branches.values()} - depended_on
+    return heads, revisions
+
+
+def write_probe(tmp_path, second_sql="CREATE TABLE probe.t2 (id int);\nSELECT kernel.register_internal('probe.t2')", third=False, depends="kernel_0010"):
     d = tmp_path / "probe"
     d.mkdir(exist_ok=True)
     py = textwrap.dedent('''
@@ -55,7 +93,7 @@ def write_probe(tmp_path, second_sql="CREATE TABLE probe.t2 (id int);\nSELECT ke
         def downgrade():
             {down_sql}
     ''')
-    spec = [(1, None, ("probe",), "kernel_0010", "", "CREATE SCHEMA probe;\nCREATE TABLE probe.t1 (id int, note text DEFAULT 'a%b:c');\nSELECT kernel.register_internal('probe.t1');"),
+    spec = [(1, None, ("probe",), depends, "", "CREATE SCHEMA probe;\nCREATE TABLE probe.t1 (id int, note text DEFAULT 'a%b:c');\nSELECT kernel.register_internal('probe.t1');"),
             (2, "probe_0001", None, None, "", second_sql)]
     if third:
         spec.append((3, "probe_0002", None, None, "min_code_epoch = 3", "ALTER TABLE probe.t1 ADD COLUMN extra int"))
@@ -69,10 +107,29 @@ def write_probe(tmp_path, second_sql="CREATE TABLE probe.t2 (id int);\nSELECT ke
 # the modules besides the kernel: platform (the store fence, background jobs and the runtime tables), the document store's branches and the vector retrieval module
 DOCSTORE_BRANCHES = ("content", "conversation", "identity", "integrations", "oauth", "platform_data")
 MODULES = ("platform", *DOCSTORE_BRANCHES, "retrieval")
-HEADS = {"kernel": (18, 11), "platform": (8, 0), "content": (3, 0), "conversation": (2, 0), "identity": (5, 0), "integrations": (2, 0), "oauth": (4, 0), "platform_data": (4, 0),
-         "graph": (13, 0), "kg": (17, 17), "retrieval": (4, 0)}
+# The tree's own heads, pinned by hand: the cross-check of the rule that computes them (test_the_computed_heads_equal_the_pinned_core_heads).
+CORE_HEADS = {"kernel": (18, 11), "platform": (8, 0), "content": (3, 0), "conversation": (2, 0), "identity": (5, 0), "integrations": (2, 0), "oauth": (4, 0), "platform_data": (4, 0),
+              "graph": (13, 0), "kg": (17, 17), "retrieval": (4, 0)}
 # platform_data_0002 depends on the last revision of most other document-store branches, so those are not heads
-REVISION_HEADS = {"platform_0008", "identity_0005", "content_0003", "oauth_0004", "platform_data_0004", "kg_0017", "retrieval_0004", "graph_0013"}      # kg depends on kernel_0017 and graph_0002, which are no longer heads
+CORE_REVISION_HEADS = {"platform_0008", "identity_0005", "content_0003", "oauth_0004", "platform_data_0004", "kg_0017", "retrieval_0004", "graph_0013"}      # kg depends on kernel_0017 and graph_0002, which are no longer heads
+# What a run of this checkout leaves, extra module directories of its edition file included.
+HEADS, REVISION_HEADS = computed_heads(version_locations())
+
+
+def test_the_computed_heads_equal_the_pinned_core_heads():
+    core = sorted(str(p) for p in (DB_DIR / "versions").iterdir() if p.is_dir() and not p.name.startswith("__"))
+    assert computed_heads(core) == (CORE_HEADS, CORE_REVISION_HEADS)
+
+
+def test_a_branch_that_depends_on_a_core_revision_takes_it_out_of_the_heads(tmp_path):
+    probe = write_probe(tmp_path, depends="graph_0013")
+    core = sorted(str(p) for p in (DB_DIR / "versions").iterdir() if p.is_dir() and not p.name.startswith("__"))
+    heads, revisions = computed_heads([*core, str(probe)])
+    assert heads == {**CORE_HEADS, "probe": (2, 0)}
+    assert revisions == (CORE_REVISION_HEADS - {"graph_0013"}) | {"probe_0002"}
+    other = tmp_path / "other"
+    other.mkdir()
+    assert computed_heads([*core, str(write_probe(other, third=True))])[0]["probe"] == (3, 3)
 
 
 def test_fresh_install(db):
@@ -215,6 +272,19 @@ def test_failed_revision_rolls_back_cleanly(db, tmp_path):
     assert epochs(cluster, name)["probe"] == (2, 0)
     with connect(cluster, name) as c:
         assert c.execute("SELECT to_regclass('probe.t2') IS NOT NULL").fetchone()[0]
+
+
+def test_a_branch_that_depends_on_a_core_revision_migrates_and_the_expected_heads_follow(db, tmp_path):
+    cluster, name = db
+    probe = write_probe(tmp_path, depends="graph_0013")
+    core = sorted(str(p) for p in (DB_DIR / "versions").iterdir() if p.is_dir() and not p.name.startswith("__"))
+    heads, revisions = computed_heads([*core, str(probe)])
+    r = run_migrate(cluster.url(name, MIGRATE), **edition_with(tmp_path, probe))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert epochs(cluster, name) == heads == {**CORE_HEADS, "probe": (2, 0)}
+    with connect(cluster, name) as c:
+        assert {v for (v,) in c.execute("SELECT version_num FROM kernel.alembic_version")} == revisions
+    assert "graph_0013" not in revisions
 
 
 def test_contract_epochs_and_dev_downgrade(db, tmp_path):

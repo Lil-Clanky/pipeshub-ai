@@ -5104,6 +5104,38 @@ class Neo4jProvider(NamedEntityGraphMixin, IGraphDBProvider):
         )
         return bool(rows)
 
+    async def delete_node_if_match(
+        self, key: str, collection: str, expected: dict[str, Any], transaction: str | None = None,
+    ) -> bool:
+        """See :meth:`IGraphDBProvider.delete_node_if_match`."""
+        if not expected:
+            raise ValueError("delete_node_if_match needs an expectation")
+        label = collection_to_label(collection)
+        parameters: dict[str, Any] = {"key": key}
+        conditions = []
+        for i, (field, value) in enumerate(expected.items()):
+            parameters[f"f{i}"] = field
+            if value is None:
+                conditions.append(f"n[$f{i}] IS NULL")
+            else:
+                parameters[f"v{i}"] = value
+                conditions.append(f"n[$f{i}] = $v{i}")
+        # The lock first, as in update_node_fields_if_match: the check reads a write that committed while this waited.
+        rows = await self.client.execute_query(
+            f"""
+            MATCH (n:{label} {{id: $key}})
+            SET n.{_MATCH_LOCK} = true
+            REMOVE n.{_MATCH_LOCK}
+            WITH n
+            WHERE {" AND ".join(conditions)}
+            DETACH DELETE n
+            RETURN 1 AS n
+            """,
+            parameters=parameters,
+            txn_id=transaction,
+        )
+        return bool(rows)
+
     async def update_node_fields_if(
         self,
         key: str,
